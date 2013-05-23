@@ -6,3 +6,11 @@ likely go away.
 
 DO NOT FORK THIS REPO or submit patches based on it. Instead use the multibench
 branch of https://github.com/ringerc/postgres .
+
+Usage:
+
+    PATH=/path/to/postgresql/bin:$PATH make install
+
+then 
+
+    pgbench --help
