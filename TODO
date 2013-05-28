@@ -1,0 +1,4 @@
+CHECKPOINT and VACUUM only run on the first master; they need to be launched in
+parallel on all nodes. One thread will be fine.
+
+Remove the arbitrary limitaion of clients%jobs==0
