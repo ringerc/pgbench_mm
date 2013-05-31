@@ -142,6 +142,12 @@ int			force_checkpoint = 0;
 double		sample_rate = 0.0;
 
 /*
+ * whether clients are throttled to a given rate, expressed as a delay in us.
+ * 0, the default means no throttling.
+ */
+int64		throttle = 0;
+
+/*
  * tablespace selection
  */
 char	   *tablespace = NULL;
@@ -214,6 +220,8 @@ typedef struct
 	int			nvariables;
 	instr_time	txn_begin;		/* used for measuring transaction latencies */
 	instr_time	stmt_begin;		/* used for measuring statement latencies */
+	int64		trigger;		/* previous/next throttling (us) */
+	bool		throttled;      /* whether current transaction was throttled */
 	int			use_file;		/* index in sql_files for this client */
 	bool		prepared[MAX_FILES];
 } CState;
@@ -372,6 +380,9 @@ usage(void)
 		   "  -S           perform SELECT-only transactions\n"
 	 "  -t NUM       number of transactions each client runs (default: 10)\n"
 		   "  -T NUM       duration of benchmark test in seconds\n"
+		   "  -H SPEC, --throttle SPEC\n"
+		   "               delay in second to throttle each client\n"
+		   "               sample specs: 0.025 40tps 25ms 25000us\n"
 		   "  -v           vacuum all four standard tables before tests\n"
  		   "  --force-checkpoint\n"
 		   "               force a CHECKPOINT before benchmarks (superuser only)\n"
@@ -1044,7 +1055,7 @@ top:
 			}
 		}
 
-		if (commands[st->state]->type == SQL_COMMAND)
+		if (!st->throttled && commands[st->state]->type == SQL_COMMAND)
 		{
 			/*
 			 * Read and discard the query result; note this is not included in
@@ -1066,26 +1077,54 @@ top:
 			discard_response(st);
 		}
 
+		/* some stuff done at the end */
 		if (commands[st->state + 1] == NULL)
 		{
-			if (is_connect)
+			/* disconnect if required and needed */
+			if (is_connect && st->con)
 			{
 				PQfinish(st->con);
 				st->con = NULL;
 			}
 
-			++st->cnt;
-			if ((st->cnt >= nxacts && duration <= 0) || timer_exceeded)
-				return clientDone(st, true);	/* exit success */
+			/* update transaction counter once, and possibly end */
+			if (!st->throttled)
+			{
+				++st->cnt;
+				if ((st->cnt >= nxacts && duration <= 0) || timer_exceeded)
+					return clientDone(st, true);	/* exit success */
+			}
+
+			/* handle throttling once, as the last post-transaction stuff */
+			if (throttle && !st->throttled)
+			{
+				/* compute delay to approximate a Poisson distribution
+				 * 1000000 => 13.8 .. 0 multiplier
+				 * if transactions are too slow or a given wait shorter than
+				 * a transaction, the next transaction will start right away.
+				 */
+				int64 wait = (int64)
+					throttle * -log(getrand(thread, 1, 1000000)/1000000.0);
+				st->trigger += wait;
+				st->sleeping = 1;
+				st->until = st->trigger;
+				st->throttled = true;
+				if (debug)
+					fprintf(stderr, "client %d throttling %d us\n",
+							st->id, (int) wait);
+				return true;
+			}
 		}
 
 		/* increment state counter */
 		st->state++;
 		if (commands[st->state] == NULL)
 		{
+			/* reset */
 			st->state = 0;
 			st->use_file = (int) getrand(thread, 0, num_files - 1);
 			commands = sql_files[st->use_file];
+			st->throttled = false;
 		}
 	}
 
@@ -2110,6 +2149,7 @@ main(int argc, char **argv)
 		{"unlogged-tables", no_argument, &unlogged_tables, 1},
 		{"sampling-rate", required_argument, NULL, 4},
 		{"aggregate-interval", required_argument, NULL, 5},
+		{"throttle", required_argument, NULL, 'H'},
 		{"force-checkpoint", no_argument, &force_checkpoint, 6},
 		{NULL, 0, NULL, 0}
 	};
@@ -2177,7 +2217,7 @@ main(int argc, char **argv)
 	state = (CState *) pg_malloc(sizeof(CState));
 	memset(state, 0, sizeof(CState));
 
-	while ((c = getopt_long(argc, argv, "ih:nvp:dqSNc:j:Crs:t:T:U:lf:D:F:M:", long_options, &optindex)) != -1)
+	while ((c = getopt_long(argc, argv, "ih:nvp:dqSNc:j:Crs:t:T:U:lf:D:F:M:H:", long_options, &optindex)) != -1)
 	{
 		switch (c)
 		{
@@ -2331,6 +2371,26 @@ main(int argc, char **argv)
 					fprintf(stderr, "invalid query mode (-M): %s\n", optarg);
 					exit(1);
 				}
+				break;
+			case 'H':
+			{
+				/* get a double from the beginning of option value */
+				double throttle_value = atof(optarg);
+				if (throttle_value <= 0.0)
+				{
+					fprintf(stderr, "invalid throttle value: %s\n", optarg);
+					exit(1);
+				}
+				/* rough handling of possible units */
+				if (strstr(optarg, "us"))
+					throttle = (int64) throttle_value;
+				else if (strstr(optarg, "ms"))
+					throttle = (int64) (1000.0 * throttle_value);
+				else if (strstr(optarg, "tps"))
+					throttle = (int64) (1000000.0 / throttle_value);
+				else /* assume that default is in second */
+					throttle = (int64) (1000000.0 * throttle_value);
+			}
 				break;
 			case 0:
 				/* This covers long options which take no argument. */
@@ -2593,6 +2653,18 @@ main(int argc, char **argv)
 	/* set random seed */
 	INSTR_TIME_SET_CURRENT(start_time);
 	srandom((unsigned int) INSTR_TIME_GET_MICROSEC(start_time));
+
+	/* initial throttling setup with regular increasing delays */
+	if (throttle)
+	{
+		int delay = throttle / nclients;
+		for (i=0; i<nclients; i++)
+		{
+			state[i].trigger = INSTR_TIME_GET_MICROSEC(start_time) + i*delay;
+			state[i].sleeping = 1;
+			state[i].until = state[i].trigger;
+		}
+	}
 
 	/* process builtin SQL scripts */
 	switch (ttype)
